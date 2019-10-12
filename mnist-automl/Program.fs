@@ -5,6 +5,8 @@ open Microsoft.ML
 open Microsoft.ML.AutoML
 open Microsoft.ML.Data
 
+// printfn "%A" (DataKind.Parse("3.5") :> float)
+
 [<CLIMutable>]
 type InputData =
     {
@@ -39,17 +41,15 @@ let absolutePath x = Path.Combine(assemblyFolderPath, x)
 
 let baseDatasetsRelativePath = @"../../../../Data"
 
-let trainDataRelativePath = Path.Combine(baseDatasetsRelativePath, "mnist_train.csv")
-let trainDataPath = absolutePath trainDataRelativePath
-
-let testDataRelativePath = Path.Combine(baseDatasetsRelativePath, "mnist_test.csv")
-let testDataPath = absolutePath testDataRelativePath
+let traintestDataRelativePath = Path.Combine(baseDatasetsRelativePath, "HIGGS.csv")
+let traintestDataPath = absolutePath traintestDataRelativePath
+let numTrain = 10500000L
 
 let baseModelsRelativePath = @"../../../../MLModels"
 let modelRelativePath = Path.Combine(baseModelsRelativePath, "Model.zip")
 let modelPath = absolutePath modelRelativePath
 
-let experimentTimeInSeconds = 300u
+let experimentTimeInSeconds = 7200u
 
 let mlContext = MLContext()
             
@@ -59,39 +59,51 @@ try
         mlContext.Data.LoadFromTextFile(path=path,
             columns=
                 [|
-                    TextLoader.Column("Number", DataKind.Single, 0)
-                    TextLoader.Column("PixelValues", DataKind.Single, 1, 784)
+                    TextLoader.Column("Label", DataKind.Single    , 0)
+                    TextLoader.Column("Features", DataKind.Single, 1, 28)
                 |],
             hasHeader = false,
             separatorChar = ',')
-    let trainData = load trainDataPath
-    let testData = load testDataPath
+    let traintestDataRaw = load traintestDataPath 
+    let pipeline = mlContext.Transforms.Conversion.ConvertType("SN","Label",
+                                    outputKind = DataKind.Boolean
+                            ).AppendCacheCheckpoint(mlContext).Append(mlContext.Transforms.DropColumns(columnNames = [| "Label" |]))
+    let transformer = pipeline.Fit(traintestDataRaw)
+    let traintestData = transformer.Transform(traintestDataRaw)
 
-    // STEP 2: Initialize our user-defined progress handler that AutoML will 
+    printfn "%A" (traintestData.Preview(maxRows = 5).RowView.[0].Values.[0].Value)
+    printfn "%A" (traintestData.Preview(maxRows = 5).ColumnView)
+    let trainData = mlContext.Data.TakeRows(traintestData,numTrain)
+    let testData  = mlContext.Data.SkipRows(traintestData,numTrain)
+
+    // STEP 2: Initialize our user-defined progress handler that AutoML will    
     // invoke after each model it produces and evaluates.
-    let progressHandler = ConsoleHelper.multiclassExperimentProgressHandler()
+    // let progressHandler = ConsoleHelper.multiclassExperimentProgressHandler()
+    let progressHandler = ConsoleHelper.binaryExperimentProgressHandler()
 
     // STEP 3: Run an AutoML multiclass classification experiment
     ConsoleHelper.consoleWriteHeader "=============== Running AutoML experiment ==============="
     printfn "Running AutoML multiclass classification experiment for %d seconds..." experimentTimeInSeconds
-    let experimentResult = mlContext.Auto().CreateMulticlassClassificationExperiment(experimentTimeInSeconds).Execute(trainData, "Number", progressHandler = progressHandler)
+    let experimentResult = mlContext.Auto().CreateBinaryClassificationExperiment(experimentTimeInSeconds).Execute(trainData, "SN", progressHandler = progressHandler)
+
+    // let experimentResult = mlContext.Auto().CreateMulticlassClassificationExperiment(experimentTimeInSeconds).Execute(trainData, "Number", progressHandler = progressHandler)
 
     // Print top models found by AutoML
     printfn ""
     printfn "Top models ranked by accuracy --"
     experimentResult.RunDetails
-    |> Seq.filter (fun r -> not (isNull r.ValidationMetrics) && not (Double.IsNaN r.ValidationMetrics.MicroAccuracy))
-    |> Seq.sortByDescending (fun x -> x.ValidationMetrics.MicroAccuracy)
+    |> Seq.filter (fun r -> not (isNull r.ValidationMetrics) && not (Double.IsNaN r.ValidationMetrics.Accuracy))
+    |> Seq.sortByDescending (fun x -> x.ValidationMetrics.AreaUnderPrecisionRecallCurve)
     |> Seq.truncate 3
-    |> Seq.iteri (fun i x -> ConsoleHelper.printMulticlassIterationMetrics (i + 1) x.TrainerName x.ValidationMetrics x.RuntimeInSeconds) 
+    |> Seq.iteri (fun i x -> ConsoleHelper.printBinaryIterationMetrics (i + 1) x.TrainerName x.ValidationMetrics x.RuntimeInSeconds) 
 
     // STEP 4: Evaluate the model and print metrics
     ConsoleHelper.consoleWriteHeader "===== Evaluating model's accuracy with test data ====="
     let bestRun = experimentResult.BestRun
     let trainedModel = bestRun.Model
     let predictions = trainedModel.Transform(testData)
-    let metrics = mlContext.MulticlassClassification.Evaluate(data = predictions, labelColumnName = "Number", scoreColumnName = "Score")
-    ConsoleHelper.printMultiClassClassificationMetrics bestRun.TrainerName metrics
+    let metrics = mlContext.BinaryClassification.Evaluate(data = predictions, labelColumnName = "SN", scoreColumnName = "Score")
+    ConsoleHelper.printBinaryClassificationMetrics bestRun.TrainerName metrics
 
     // STEP 5: Save/persist the trained model to a .ZIP file
     mlContext.Model.Save(trainedModel, trainData.Schema, modelPath);
